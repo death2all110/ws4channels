@@ -36,6 +36,7 @@ let browser = null;
 let page = null;
 let captureInterval = null;
 let isStreamReady = false;
+let lastScreenshot = null; // Keep last successful frame to maintain continuity
 
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -165,10 +166,11 @@ async function startTranscoding() {
 
   ffmpegStream = new PassThrough();
 
+  // Keep ffmpeg running and generate PTS for image2pipe input so timelines are continuous.
   ffmpegProc = ffmpeg()
     .input(ffmpegStream)
     .inputFormat('image2pipe')
-    .inputOptions([`-framerate ${FRAME_RATE}`])
+    .inputOptions([`-framerate ${FRAME_RATE}`, '-fflags +genpts'])
     .input(path.join(__dirname, 'audio_list.txt'))
     .inputOptions(['-f concat', '-safe 0', '-stream_loop -1'])
     .complexFilter([
@@ -195,8 +197,9 @@ async function startTranscoding() {
     })
     .on('error', async (err) => {
       console.error('FFmpeg error:', err);
+      // Avoid tight restart loops; teardown cleanly and restart after a short delay.
       await stopTranscoding();
-      startTranscoding();
+      setTimeout(() => startTranscoding().catch(e => console.error('Restart failed:', e)), 2000);
     })
     .on('end', () => {
       ffmpegProc = null;
@@ -204,26 +207,43 @@ async function startTranscoding() {
       isStreamReady = false;
     });
 
-  captureInterval = setInterval(async () => {
-    if (!ffmpegProc || !ffmpegStream || !page) return;
+  // Named capture loop so it can use the last successful frame when captures fail.
+  async function captureLoop() {
+    if (!ffmpegProc || !ffmpegStream) return;
     try {
-      if (page.isClosed()) {
-        clearInterval(captureInterval);
+      if (!page || (typeof page.isClosed === 'function' && await page.isClosed())) {
+        console.warn('Page closed or unavailable — restarting browser');
         await startBrowser();
-        captureInterval = setInterval(arguments.callee, 1000 / FRAME_RATE);
         return;
       }
       const screenshot = await page.screenshot({
         type: 'jpeg',
         clip: { x: 4, y: 47, width: 631, height: 480 }
       });
-      ffmpegStream.write(screenshot);
+      lastScreenshot = screenshot;
+      const ok = ffmpegStream.write(screenshot);
+      if (!ok) {
+        // backpressure: wait a tick to avoid excessive memory growth
+        await new Promise(resolve => ffmpegStream.once('drain', resolve));
+      }
     } catch (err) {
-      clearInterval(captureInterval);
-      await startBrowser();
-      captureInterval = setInterval(arguments.callee, 1000 / FRAME_RATE);
+      console.error('Screenshot capture failed:', err.message || err);
+      // If we have a last good frame, write it to keep FFmpeg timeline continuous.
+      if (lastScreenshot && ffmpegStream) {
+        try {
+          ffmpegStream.write(lastScreenshot);
+        } catch (e) {
+          console.error('Failed to write lastScreenshot:', e.message || e);
+        }
+      } else {
+        // No last frame available — wait briefly and try again.
+        await waitFor(500);
+      }
     }
-  }, 1000 / FRAME_RATE);
+  }
+
+  // Start the regular capture loop.
+  captureInterval = setInterval(captureLoop, 1000 / FRAME_RATE);
 
   ffmpegProc.run();
 }
@@ -233,11 +253,27 @@ async function stopTranscoding() {
   captureInterval = null;
   isStreamReady = false;
 
-  if (ffmpegProc) ffmpegProc.kill('SIGINT');
-  ffmpegProc = null;
+  if (ffmpegProc) {
+    try {
+      ffmpegProc.kill('SIGINT');
+    } catch (e) {
+      console.error('Error killing FFmpeg process:', e.message || e);
+    }
+    ffmpegProc = null;
+  }
+
+  if (ffmpegStream) {
+    try {
+      ffmpegStream.end();
+    } catch (e) {}
+    ffmpegStream = null;
+  }
+
+  lastScreenshot = null;
 
   if (browser) await browser.close().catch(() => {});
   browser = null;
+  page = null;
 }
 
 app.get('/playlist.m3u', (req, res) => {
