@@ -17,6 +17,10 @@ const HLS_SETUP_DELAY = 2000;
 const FRAME_RATE = process.env.FRAME_RATE || 10;
 const chnlNum = process.env.CHANNEL_NUMBER || '275';
 
+// Idle shutdown to avoid generating HLS segments while nobody's watching.
+// Prevents "old segments served then fast-forward to live".
+const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '60000', 10);
+
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
 const LOGO_DIR = path.join(__dirname, 'logo');
@@ -27,15 +31,19 @@ const HLS_FILE = path.join(OUTPUT_DIR, 'stream.m3u8');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir);
 });
 
-app.use('/stream', express.static(OUTPUT_DIR));
 app.use('/logo', express.static(LOGO_DIR));
 
+// State
 let ffmpegProc = null;
 let ffmpegStream = null;
 let browser = null;
 let page = null;
 let captureInterval = null;
 let isStreamReady = false;
+let lastScreenshot = null; // Keep last successful frame to maintain continuity
+let startingPromise = null; // to prevent concurrent startTranscoding runs
+let idleTimer = null;
+let lastClientTime = 0;
 
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -159,73 +167,122 @@ async function startBrowser() {
   await page.setViewport({ width: 1280, height: 720 });
 }
 
-async function startTranscoding() {
-  await startBrowser();
-  createAudioInputFile();
-
-  ffmpegStream = new PassThrough();
-
-  ffmpegProc = ffmpeg()
-    .input(ffmpegStream)
-    .inputFormat('image2pipe')
-    .inputOptions([`-framerate ${FRAME_RATE}`])
-    .input(path.join(__dirname, 'audio_list.txt'))
-    .inputOptions(['-f concat', '-safe 0', '-stream_loop -1'])
-    .complexFilter([
-      '[0:v]scale=1280:720[v]',
-      '[1:a]volume=0.5[a]'
-    ])
-    .outputOptions([
-      '-map [v]',
-      '-map [a]',
-      '-c:v libx264',
-      '-c:a aac',
-      '-b:a 128k',
-      '-preset ultrafast',
-      '-b:v 1000k',
-      '-f hls',
-      '-hls_time 2',
-      '-hls_list_size 2',
-      '-hls_flags delete_segments'
-    ])
-    .output(HLS_FILE)
-    .on('start', () => {
-      console.log('Started FFmpeg');
-      setTimeout(() => isStreamReady = true, HLS_SETUP_DELAY);
-    })
-    .on('error', async (err) => {
-      console.error('FFmpeg error:', err);
-      await stopTranscoding();
-      startTranscoding();
-    })
-    .on('end', () => {
-      ffmpegProc = null;
-      ffmpegStream = null;
-      isStreamReady = false;
-    });
-
-  captureInterval = setInterval(async () => {
-    if (!ffmpegProc || !ffmpegStream || !page) return;
-    try {
-      if (page.isClosed()) {
-        clearInterval(captureInterval);
-        await startBrowser();
-        captureInterval = setInterval(arguments.callee, 1000 / FRAME_RATE);
-        return;
+function cleanOutputDir() {
+  try {
+    const files = fs.readdirSync(OUTPUT_DIR);
+    for (const f of files) {
+      if (f.endsWith('.m3u8') || f.endsWith('.ts') || f.endsWith('.key')) {
+        try { fs.unlinkSync(path.join(OUTPUT_DIR, f)); } catch (e) {}
       }
-      const screenshot = await page.screenshot({
-        type: 'jpeg',
-        clip: { x: 4, y: 47, width: 631, height: 480 }
-      });
-      ffmpegStream.write(screenshot);
-    } catch (err) {
-      clearInterval(captureInterval);
-      await startBrowser();
-      captureInterval = setInterval(arguments.callee, 1000 / FRAME_RATE);
     }
-  }, 1000 / FRAME_RATE);
+  } catch (e) {
+    console.warn('cleanOutputDir error:', e.message || e);
+  }
+}
 
-  ffmpegProc.run();
+async function startTranscoding() {
+  // ensure only one startTranscoding runs at once
+  if (startingPromise) return startingPromise;
+  startingPromise = (async () => {
+    // remove leftover HLS files from previous runs so clients don't get old segments
+    cleanOutputDir();
+
+    await startBrowser();
+    createAudioInputFile();
+
+    ffmpegStream = new PassThrough();
+
+    // Keep ffmpeg running and generate PTS for image2pipe input so timelines are continuous.
+    ffmpegProc = ffmpeg()
+      .input(ffmpegStream)
+      .inputFormat('image2pipe')
+      .inputOptions([`-framerate ${FRAME_RATE}`, '-fflags +genpts'])
+      .input(path.join(__dirname, 'audio_list.txt'))
+      .inputOptions(['-f concat', '-safe 0', '-stream_loop -1'])
+      .complexFilter([
+        '[0:v]scale=1280:720[v]',
+        '[1:a]volume=0.5[a]'
+      ])
+      .outputOptions([
+        '-map [v]',
+        '-map [a]',
+        '-c:v libx264',
+        '-c:a aac',
+        '-b:a 128k',
+        '-preset ultrafast',
+        '-b:v 1000k',
+        '-f hls',
+        '-hls_time 2',
+        '-hls_list_size 3', // keep a small sliding window
+        '-hls_flags delete_segments' // ensure old segments are deleted by FFmpeg
+      ])
+      .output(HLS_FILE)
+      .on('start', () => {
+        console.log('Started FFmpeg');
+        setTimeout(() => isStreamReady = true, HLS_SETUP_DELAY);
+      })
+      .on('error', async (err) => {
+        console.error('FFmpeg error:', err);
+        // teardown and allow subsequent requests to restart after a short delay
+        await stopTranscoding();
+        setTimeout(() => { startingPromise = null; }, 2000);
+      })
+      .on('end', () => {
+        ffmpegProc = null;
+        ffmpegStream = null;
+        isStreamReady = false;
+        startingPromise = null;
+      });
+
+    // Named capture loop so it can use the last successful frame when captures fail.
+    async function captureLoop() {
+      if (!ffmpegProc || !ffmpegStream) return;
+      try {
+        if (!page || (typeof page.isClosed === 'function' && await page.isClosed())) {
+          console.warn('Page closed or unavailable — restarting browser');
+          await startBrowser();
+          return;
+        }
+        const screenshot = await page.screenshot({
+          type: 'jpeg',
+          clip: { x: 4, y: 47, width: 631, height: 480 }
+        });
+        lastScreenshot = screenshot;
+        const ok = ffmpegStream.write(screenshot);
+        if (!ok) {
+          // backpressure: wait a tick to avoid excessive memory growth
+          await new Promise(resolve => ffmpegStream.once('drain', resolve));
+        }
+      } catch (err) {
+        console.error('Screenshot capture failed:', err.message || err);
+        // If we have a last good frame, write it to keep FFmpeg timeline continuous.
+        if (lastScreenshot && ffmpegStream) {
+          try {
+            ffmpegStream.write(lastScreenshot);
+          } catch (e) {
+            console.error('Failed to write lastScreenshot:', e.message || e);
+          }
+        } else {
+          // No last frame available — wait briefly and try again.
+          await waitFor(500);
+        }
+      }
+    }
+
+    // Start the regular capture loop.
+    captureInterval = setInterval(captureLoop, 1000 / FRAME_RATE);
+
+    ffmpegProc.run();
+
+    // startingPromise resolves once ffmpegProc exists (not necessarily isStreamReady)
+    // callers that need the HLS playlist ready should wait for isStreamReady separately.
+    startingPromise = null;
+  })().catch(err => {
+    startingPromise = null;
+    throw err;
+  });
+
+  return startingPromise;
 }
 
 async function stopTranscoding() {
@@ -233,16 +290,83 @@ async function stopTranscoding() {
   captureInterval = null;
   isStreamReady = false;
 
-  if (ffmpegProc) ffmpegProc.kill('SIGINT');
-  ffmpegProc = null;
+  if (ffmpegProc) {
+    try {
+      ffmpegProc.kill('SIGINT');
+    } catch (e) {
+      console.error('Error killing FFmpeg process:', e.message || e);
+    }
+    ffmpegProc = null;
+  }
+
+  if (ffmpegStream) {
+    try {
+      ffmpegStream.end();
+    } catch (e) {}
+    ffmpegStream = null;
+  }
+
+  lastScreenshot = null;
 
   if (browser) await browser.close().catch(() => {});
   browser = null;
+  page = null;
 }
 
-app.get('/playlist.m3u', (req, res) => {
+// Ensure transcoding runs on-demand and schedule idle stop
+async function ensureTranscodingRunning(awaitReady = false, waitMs = 5000) {
+  lastClientTime = Date.now();
+  scheduleIdleStop();
+
+  if (ffmpegProc) {
+    if (awaitReady) {
+      const start = Date.now();
+      while (!isStreamReady && Date.now() - start < waitMs) {
+        await waitFor(100);
+      }
+    }
+    return;
+  }
+
+  // start it
+  try {
+    await startTranscoding();
+  } catch (e) {
+    console.error('Failed to start transcoding:', e);
+    return;
+  }
+
+  if (awaitReady) {
+    const start = Date.now();
+    while (!isStreamReady && Date.now() - start < waitMs) {
+      await waitFor(100);
+    }
+  }
+}
+
+function scheduleIdleStop() {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(async () => {
+    const idleDuration = Date.now() - lastClientTime;
+    if (idleDuration >= IDLE_TIMEOUT_MS) {
+      console.log('No clients for', IDLE_TIMEOUT_MS, 'ms — stopping transcoding to avoid stale segments');
+      await stopTranscoding();
+      // remove leftover files to ensure next start doesn't serve old segments
+      cleanOutputDir();
+    } else {
+      scheduleIdleStop();
+    }
+  }, IDLE_TIMEOUT_MS + 1000);
+}
+
+// Serve playlist and ensure we start transcoding on demand. Wait briefly for playlist to be ready.
+app.get('/playlist.m3u', async (req, res) => {
   const host = req.headers.host || `localhost:${STREAM_PORT}`;
   const baseUrl = `http://${host}`;
+
+  // start transcoding and wait for the HLS playlist to be produced (best-effort)
+  await ensureTranscodingRunning(true, 5000);
+
   const m3uContent = `#EXTM3U
 #EXTINF:-1 channel-id="WS4000" tvg-id="WS4000" tvg-chno="${chnlNum}" tvc-guide-placeholders="3600" tvc-guide-title="Local Weather" tvc-guide-description="Enjoy your local weather with a touch of nostalgia." tvc-guide-art="${baseUrl}/logo/ws4000.png" tvg-logo="${baseUrl}/logo/ws4000.png",WeatherStar 4000
 ${baseUrl}/stream/stream.m3u8
@@ -261,22 +385,24 @@ app.get('/health', (req, res) => {
   res.status(isStreamReady ? 200 : 503).json({ ready: isStreamReady });
 });
 
+// Middleware: start transcoding on any request to /stream/* (segments or playlist)
+app.use('/stream', async (req, res, next) => {
+  // update client activity and ensure transcoding is running; don't block segments too long
+  lastClientTime = Date.now();
+  scheduleIdleStop();
+  try {
+    // start but don't wait long for readiness when serving segments
+    await ensureTranscodingRunning(false);
+  } catch (e) {
+    console.error('Error ensuring transcoding for stream request:', e);
+  }
+  next();
+}, express.static(OUTPUT_DIR));
+
 const { cpus, memoryMB } = getContainerLimits();
 console.log(`Running with ${cpus} CPU cores, ${memoryMB}MB RAM`);
 
-app.listen(STREAM_PORT, async () => {
+app.listen(STREAM_PORT, () => {
   console.log(`Streaming server running on port ${STREAM_PORT}`);
-  await startTranscoding();
-});
-
-process.on('SIGINT', async () => {
-  console.log('SIGINT received');
-  await stopTranscoding();
-  process.exit();
-});
-
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received');
-  await stopTranscoding();
-  process.exit();
-});
+  // Do not start transcoding automatically on startup.
+  // It will be started on-demand when a client requests /playlist.m3u or /stream/*
