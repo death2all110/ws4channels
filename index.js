@@ -403,6 +403,7 @@ const { cpus, memoryMB } = getContainerLimits();
 console.log(`Running with ${cpus} CPU cores, ${memoryMB}MB RAM`);
 
 app.listen(STREAM_PORT, () => {
-  console.log(`Streaming server running on port ${STREAM_PORT}`);
-  // Do not start transcoding automatically on startup.
-  // It will be started on-demand when a client requests /playlist.m3u or /stream/*
+    console.log(`Streaming server running on port ${STREAM_PORT}`);
+    // Do not start transcoding automatically on startup.
+    // It will be started on-demand when a client requests /playlist.m3u or /stream/*
+}
