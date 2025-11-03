@@ -17,9 +17,10 @@ const HLS_SETUP_DELAY = 2000;
 const FRAME_RATE = process.env.FRAME_RATE || 10;
 const chnlNum = process.env.CHANNEL_NUMBER || '275';
 
-// Idle shutdown to avoid generating HLS segments while nobody's watching.
-// Prevents "old segments served then fast-forward to live".
+// Idle behavior
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '60000', 10);
+const IDLE_KEEP_ALIVE = (process.env.IDLE_KEEP_ALIVE || 'true') === 'true'; // when true, keep ffmpeg running and throttle captures instead of stopping
+const IDLE_CAPTURE_MS = parseInt(process.env.IDLE_CAPTURE_MS || '1000', 10); // capture interval when idle (ms)
 
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
@@ -44,6 +45,8 @@ let lastScreenshot = null; // Keep last successful frame to maintain continuity
 let startingPromise = null; // to prevent concurrent startTranscoding runs
 let idleTimer = null;
 let lastClientTime = 0;
+let idleMode = false;
+let setCaptureRate = null; // function assigned in startTranscoding to change capture interval
 
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -234,8 +237,8 @@ async function startTranscoding() {
         startingPromise = null;
       });
 
-    // Named capture loop so it can use the last successful frame when captures fail.
-    async function captureLoop() {
+    // captureLoop defined here but referenced externally via setCaptureRate
+    async function captureLoopFn() {
       if (!ffmpegProc || !ffmpegStream) return;
       try {
         if (!page || (typeof page.isClosed === 'function' && await page.isClosed())) {
@@ -269,13 +272,18 @@ async function startTranscoding() {
       }
     }
 
-    // Start the regular capture loop.
-    captureInterval = setInterval(captureLoop, 1000 / FRAME_RATE);
+    // allow external rate changes by assigning setCaptureRate here
+    setCaptureRate = (ms) => {
+      if (captureInterval) clearInterval(captureInterval);
+      captureInterval = setInterval(captureLoopFn, ms);
+    };
+
+    // Start at normal capture rate
+    setCaptureRate(Math.max(20, Math.round(1000 / FRAME_RATE)));
 
     ffmpegProc.run();
 
     // startingPromise resolves once ffmpegProc exists (not necessarily isStreamReady)
-    // callers that need the HLS playlist ready should wait for isStreamReady separately.
     startingPromise = null;
   })().catch(err => {
     startingPromise = null;
@@ -283,6 +291,36 @@ async function startTranscoding() {
   });
 
   return startingPromise;
+}
+
+async function enterIdleMode() {
+  if (!IDLE_KEEP_ALIVE) {
+    // default behavior is to fully stop
+    return stopTranscoding();
+  }
+  if (idleMode) return;
+  idleMode = true;
+  console.log('Entering idle mode — throttling captures to save CPU but keeping FFmpeg alive');
+  try {
+    if (typeof setCaptureRate === 'function') {
+      setCaptureRate(Math.max(200, IDLE_CAPTURE_MS)); // e.g. 1 fps or as configured
+    }
+  } catch (e) {
+    console.error('Failed to switch to idle capture rate:', e.message || e);
+  }
+}
+
+async function exitIdleMode() {
+  if (!idleMode) return;
+  idleMode = false;
+  console.log('Exiting idle mode — restoring normal capture rate');
+  try {
+    if (typeof setCaptureRate === 'function') {
+      setCaptureRate(Math.max(20, Math.round(1000 / FRAME_RATE)));
+    }
+  } catch (e) {
+    console.error('Failed to restore capture rate:', e.message || e);
+  }
 }
 
 async function stopTranscoding() {
@@ -307,6 +345,7 @@ async function stopTranscoding() {
   }
 
   lastScreenshot = null;
+  idleMode = false;
 
   if (browser) await browser.close().catch(() => {});
   browser = null;
@@ -317,6 +356,11 @@ async function stopTranscoding() {
 async function ensureTranscodingRunning(awaitReady = false, waitMs = 5000) {
   lastClientTime = Date.now();
   scheduleIdleStop();
+
+  // if ffmpeg running but idle mode active, wake it
+  if (ffmpegProc && idleMode) {
+    await exitIdleMode();
+  }
 
   if (ffmpegProc) {
     if (awaitReady) {
@@ -349,10 +393,15 @@ function scheduleIdleStop() {
   idleTimer = setTimeout(async () => {
     const idleDuration = Date.now() - lastClientTime;
     if (idleDuration >= IDLE_TIMEOUT_MS) {
-      console.log('No clients for', IDLE_TIMEOUT_MS, 'ms — stopping transcoding to avoid stale segments');
-      await stopTranscoding();
-      // remove leftover files to ensure next start doesn't serve old segments
-      cleanOutputDir();
+      if (IDLE_KEEP_ALIVE) {
+        // throttle captures instead of stopping ffmpeg
+        await enterIdleMode();
+      } else {
+        console.log('No clients for', IDLE_TIMEOUT_MS, 'ms — stopping transcoding to avoid stale segments');
+        await stopTranscoding();
+        // remove leftover files to ensure next start doesn't serve old segments
+        cleanOutputDir();
+      }
     } else {
       scheduleIdleStop();
     }
@@ -403,7 +452,19 @@ const { cpus, memoryMB } = getContainerLimits();
 console.log(`Running with ${cpus} CPU cores, ${memoryMB}MB RAM`);
 
 app.listen(STREAM_PORT, () => {
-    console.log(`Streaming server running on port ${STREAM_PORT}`);
-    // Do not start transcoding automatically on startup.
-    // It will be started on-demand when a client requests /playlist.m3u or /stream/*
+  console.log(`Streaming server running on port ${STREAM_PORT}`);
+  // Do not start transcoding automatically on startup.
+  // It will be started on-demand when a client requests /playlist.m3u or /stream/*
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received');
+  await stopTranscoding();
+  process.exit();
+});
+
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received');
+  await stopTranscoding();
+  process.exit();
 });
