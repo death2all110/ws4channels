@@ -22,6 +22,10 @@ const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '60000', 10);
 const IDLE_KEEP_ALIVE = (process.env.IDLE_KEEP_ALIVE || 'true') === 'true'; // when true, keep ffmpeg running and throttle captures instead of stopping
 const IDLE_CAPTURE_MS = parseInt(process.env.IDLE_CAPTURE_MS || '1000', 10); // capture interval when idle (ms)
 
+// Wake-up tuning (temporarily accelerate capture to force fresh segments)
+const WAKE_CAPTURE_MS = parseInt(process.env.WAKE_CAPTURE_MS || '100', 10); // capture interval during wake
+const WAKE_TIMEOUT_MS = parseInt(process.env.WAKE_TIMEOUT_MS || '5000', 10); // how long to wait for a fresh segment during wake
+
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
 const LOGO_DIR = path.join(__dirname, 'logo');
@@ -210,6 +214,27 @@ async function waitForFreshSegment(timeoutMs = 5000, freshWindowMs = 4000) {
   return false;
 }
 
+// Temporarily accelerate captures to force FFmpeg to produce fresh segments quickly,
+// wait for a fresh segment, then restore the normal capture rate.
+async function wakeAndWaitFreshSegment(timeoutMs = WAKE_TIMEOUT_MS) {
+  if (typeof setCaptureRate !== 'function') return false;
+  const normalMs = Math.max(20, Math.round(1000 / FRAME_RATE));
+  const wakeMs = Math.max(20, Math.min(WAKE_CAPTURE_MS, normalMs)); // don't exceed normal too much
+  console.log('Waking FFmpeg: accelerating capture to', wakeMs, 'ms for up to', timeoutMs, 'ms');
+  try {
+    setCaptureRate(wakeMs);
+    const ok = await waitForFreshSegment(timeoutMs, Math.min(4000, timeoutMs));
+    if (!ok) console.warn('wakeAndWaitFreshSegment: timed out waiting for fresh segment');
+    return ok;
+  } catch (e) {
+    console.error('wakeAndWaitFreshSegment error:', e.message || e);
+    return false;
+  } finally {
+    // restore normal rate
+    try { setCaptureRate(normalMs); } catch (e) {}
+  }
+}
+
 async function startTranscoding() {
   // ensure only one startTranscoding runs at once
   if (startingPromise) return startingPromise;
@@ -393,16 +418,22 @@ async function ensureTranscodingRunning(awaitReady = false, waitMs = 5000) {
   lastClientTime = Date.now();
   scheduleIdleStop();
 
-  // if ffmpeg running but idle mode active, wake it
+  // if ffmpeg running but idle mode active, wake it and force fresh segments
   if (ffmpegProc && idleMode) {
     await exitIdleMode();
+    // Accelerate captures and wait for a fresh segment to ensure we don't serve stale content
+    const ok = await wakeAndWaitFreshSegment(Math.min(WAKE_TIMEOUT_MS, waitMs));
+    if (!ok) console.warn('Failed to obtain fresh segment after exiting idle mode');
   }
 
   if (ffmpegProc) {
     if (awaitReady) {
-      // wait for a fresh segment so clients don't get stale ones
+      // if an ffmpeg run already exists, prefer to wait for a fresh segment; if none, try an aggressive wake
       const ok = await waitForFreshSegment(waitMs, Math.min(4000, waitMs));
-      if (!ok) console.warn('Timed out waiting for fresh segment (existing ffmpeg run)');
+      if (!ok) {
+        console.warn('Timed out waiting for fresh segment (existing ffmpeg run), attempting wake burst');
+        await wakeAndWaitFreshSegment(Math.min(WAKE_TIMEOUT_MS, waitMs));
+      }
     }
     return;
   }
@@ -423,8 +454,13 @@ async function ensureTranscodingRunning(awaitReady = false, waitMs = 5000) {
       await waitFor(100);
     }
     const remaining = Math.max(0, waitMs - (Date.now() - start));
-    const ok = await waitForFreshSegment(remaining, Math.min(4000, remaining));
-    if (!ok) console.warn('Timed out waiting for fresh segment after starting ffmpeg');
+    // try waiting first, then do an aggressive wake if needed
+    let ok = await waitForFreshSegment(remaining, Math.min(4000, remaining));
+    if (!ok) {
+      console.warn('Timed out waiting for fresh segment after starting ffmpeg — running wake burst');
+      ok = await wakeAndWaitFreshSegment(Math.min(WAKE_TIMEOUT_MS, remaining));
+      if (!ok) console.warn('Timed out waiting for fresh segment even after wake burst');
+    }
   }
 }
 
