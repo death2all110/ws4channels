@@ -51,7 +51,7 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:latest
           
           # This is still the magic part:
-          pull: true
+          #pull: true
           
       # 5. This step cleans up old, untagged images.
       - name: Clean up old image versions
