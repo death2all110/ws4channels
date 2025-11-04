@@ -183,6 +183,33 @@ function cleanOutputDir() {
   }
 }
 
+// returns newest segment mtime (ms since epoch) or 0 if none
+function latestSegmentMtime() {
+  try {
+    const files = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.ts'));
+    let newest = 0;
+    for (const f of files) {
+      const st = fs.statSync(path.join(OUTPUT_DIR, f));
+      const m = st.mtimeMs || st.mtime.getTime();
+      if (m > newest) newest = m;
+    }
+    return newest;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// wait until a .ts segment appears with mtime within freshWindowMs of now
+async function waitForFreshSegment(timeoutMs = 5000, freshWindowMs = 4000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const newest = latestSegmentMtime();
+    if (newest > 0 && (Date.now() - newest) <= freshWindowMs) return true;
+    await waitFor(100);
+  }
+  return false;
+}
+
 async function startTranscoding() {
   // ensure only one startTranscoding runs at once
   if (startingPromise) return startingPromise;
@@ -301,6 +328,15 @@ async function enterIdleMode() {
   if (idleMode) return;
   idleMode = true;
   console.log('Entering idle mode — throttling captures to save CPU but keeping FFmpeg alive');
+
+  // remove old segments immediately so clients won't be served stale files
+  // this ensures the next viewer will be served fresh segments after we accelerate captures
+  try {
+    cleanOutputDir();
+  } catch (e) {
+    console.warn('Failed to clean output dir on entering idle mode:', e.message || e);
+  }
+
   try {
     if (typeof setCaptureRate === 'function') {
       setCaptureRate(Math.max(200, IDLE_CAPTURE_MS)); // e.g. 1 fps or as configured
@@ -364,10 +400,9 @@ async function ensureTranscodingRunning(awaitReady = false, waitMs = 5000) {
 
   if (ffmpegProc) {
     if (awaitReady) {
-      const start = Date.now();
-      while (!isStreamReady && Date.now() - start < waitMs) {
-        await waitFor(100);
-      }
+      // wait for a fresh segment so clients don't get stale ones
+      const ok = await waitForFreshSegment(waitMs, Math.min(4000, waitMs));
+      if (!ok) console.warn('Timed out waiting for fresh segment (existing ffmpeg run)');
     }
     return;
   }
@@ -381,10 +416,15 @@ async function ensureTranscodingRunning(awaitReady = false, waitMs = 5000) {
   }
 
   if (awaitReady) {
+    // wait for HLS to be ready and for fresh TS segment(s) to appear
     const start = Date.now();
+    // first a small delay for ffmpeg to initialize playlist
     while (!isStreamReady && Date.now() - start < waitMs) {
       await waitFor(100);
     }
+    const remaining = Math.max(0, waitMs - (Date.now() - start));
+    const ok = await waitForFreshSegment(remaining, Math.min(4000, remaining));
+    if (!ok) console.warn('Timed out waiting for fresh segment after starting ffmpeg');
   }
 }
 
@@ -413,7 +453,7 @@ app.get('/playlist.m3u', async (req, res) => {
   const host = req.headers.host || `localhost:${STREAM_PORT}`;
   const baseUrl = `http://${host}`;
 
-  // start transcoding and wait for the HLS playlist to be produced (best-effort)
+  // start transcoding and wait for the HLS playlist and a fresh segment to be produced (best-effort)
   await ensureTranscodingRunning(true, 5000);
 
   const m3uContent = `#EXTM3U
