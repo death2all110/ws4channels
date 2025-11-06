@@ -187,10 +187,10 @@ function cleanOutputDir() {
   }
 }
 
-// returns newest segment mtime (ms since epoch) or 0 if none
+// returns newest segment or playlist mtime (ms since epoch) or 0 if none
 function latestSegmentMtime() {
   try {
-    const files = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.ts'));
+    const files = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.ts') || f === path.basename(HLS_FILE));
     let newest = 0;
     for (const f of files) {
       const st = fs.statSync(path.join(OUTPUT_DIR, f));
@@ -203,7 +203,7 @@ function latestSegmentMtime() {
   }
 }
 
-// wait until a .ts segment appears with mtime within freshWindowMs of now
+// wait until a .ts segment or playlist appears with mtime within freshWindowMs of now
 async function waitForFreshSegment(timeoutMs = 5000, freshWindowMs = 4000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -222,6 +222,8 @@ async function wakeAndWaitFreshSegment(timeoutMs = WAKE_TIMEOUT_MS) {
   const wakeMs = Math.max(20, Math.min(WAKE_CAPTURE_MS, normalMs)); // don't exceed normal too much
   console.log('Waking FFmpeg: accelerating capture to', wakeMs, 'ms for up to', timeoutMs, 'ms');
   try {
+    // delete current playlist/segments to avoid serving stale files while waking
+    try { cleanOutputDir(); } catch (e) {}
     setCaptureRate(wakeMs);
     const ok = await waitForFreshSegment(timeoutMs, Math.min(4000, timeoutMs));
     if (!ok) console.warn('wakeAndWaitFreshSegment: timed out waiting for fresh segment');
@@ -418,8 +420,16 @@ async function ensureTranscodingRunning(awaitReady = false, waitMs = 5000) {
   lastClientTime = Date.now();
   scheduleIdleStop();
 
+  // If we are about to start a fresh run or wake from idle, delete stale files first.
+  // This prevents serving old segments while we wait for fresh ones.
+  if (!ffmpegProc) {
+    try { cleanOutputDir(); } catch (e) {}
+  }
+
   // if ffmpeg running but idle mode active, wake it and force fresh segments
   if (ffmpegProc && idleMode) {
+    // remove any stale playlist/segments left behind while idle
+    try { cleanOutputDir(); } catch (e) {}
     await exitIdleMode();
     // Accelerate captures and wait for a fresh segment to ensure we don't serve stale content
     const ok = await wakeAndWaitFreshSegment(Math.min(WAKE_TIMEOUT_MS, waitMs));
@@ -488,6 +498,12 @@ function scheduleIdleStop() {
 app.get('/playlist.m3u', async (req, res) => {
   const host = req.headers.host || `localhost:${STREAM_PORT}`;
   const baseUrl = `http://${host}`;
+
+  // delete stale files immediately if ffmpeg isn't actively producing fresh ones,
+  // so the client won't get old segments while we wake the stream.
+  if (!ffmpegProc || idleMode) {
+    try { cleanOutputDir(); } catch (e) {}
+  }
 
   // start transcoding and wait for the HLS playlist and a fresh segment to be produced (best-effort)
   await ensureTranscodingRunning(true, 5000);
